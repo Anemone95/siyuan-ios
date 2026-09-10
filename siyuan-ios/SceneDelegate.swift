@@ -30,6 +30,12 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   private var hasPendingShorthandRequest = false
   private var pendingShorthandText = ""
 
+  @available(iOS 26.0, *)
+  func preferredWindowingControlStyle(for scene: UIWindowScene) -> UIWindowScene.WindowingControlStyle {
+    // 窗口控件与应用顶部栏共用区域，由网页工具栏避让。
+    return .unified
+  }
+
   func scene(
     _ scene: UIScene, willConnectTo session: UISceneSession,
     options connectionOptions: UIScene.ConnectionOptions
@@ -255,6 +261,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   }
 
   func sceneDidBecomeActive(_ scene: UIScene) {
+    (window?.rootViewController as? ViewController)?.refreshWindowControlLayout()
     LANSyncBonjour.shared.start()
     let keepShorthandRoot = pendingShorthandShortcut
     pendingShorthandShortcut = false

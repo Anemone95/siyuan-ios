@@ -52,11 +52,30 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   var keyboardEndFrame: CGRect?
   var isOrientationTransitioning = false
   var isDarkStyle = false
+  private var windowControlInsetsPayload: String?
+  private var windowControlLayoutRefreshPending = false
+  @available(iOS 26.0, *)
+  private var isWindowedIPad: Bool {
+    guard let window = view.window, let scene = window.windowScene,
+      traitCollection.userInterfaceIdiom == .pad else {
+      return false
+    }
+    // 在同一屏幕坐标系比较完整矩形，兼容分屏、浮动窗口及外接屏幕。
+    let screen = scene.screen.coordinateSpace
+    let frame = window.convert(window.bounds, to: screen)
+    let bounds = screen.bounds
+    return abs(frame.minX - bounds.minX) > 1 || abs(frame.minY - bounds.minY) > 1
+      || abs(frame.width - bounds.width) > 1 || abs(frame.height - bounds.height) > 1
+  }
   private var webViewLayoutFrame: CGRect {
     // URL.path 会去掉目录末尾的斜杠，同时兼容目录入口和显式页面入口。
     let path = ViewController.syWebView.url?.path ?? ""
     let isMobilePage = path == "/stage/build/mobile" || path.hasPrefix("/stage/build/mobile/")
     var frame = view.safeAreaLayoutGuide.layoutFrame
+    if #available(iOS 26.0, *), traitCollection.userInterfaceIdiom == .pad, !isMobilePage {
+      // 网页背景覆盖整个窗口，系统控件占位由网页顶部栏内部消化，避免露出原生底色。
+      frame = view.bounds
+    }
     if isMobilePage {
       // 顶部和左右由原生容器避让安全区，仅将移动页面延伸到屏幕底边。
       frame.size.height = max(0, view.bounds.maxY - frame.minY)
@@ -196,7 +215,8 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       name: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil)
     waitFotKernelHttpServing()
     ViewController.syWebView.isHidden = true
-    view.addSubview(ViewController.syWebView)
+    // 网页置于容器底层，保留系统窗口控件的显示层级。
+    view.insertSubview(ViewController.syWebView, at: 0)
     loadBootPage(url)
     startBootProgressMonitor()
     #if DEBUG
@@ -217,7 +237,55 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     {
       ViewController.syWebView.frame = webViewLayoutFrame
     }
+    updateWindowControlInsets()
   }
+
+  private func updateWindowControlInsets() {
+    guard #available(iOS 26.0, *), view.window != nil else { return }
+    let webView = ViewController.syWebView
+    guard isReadyMainPage(webView.url), webView.bounds.width > 0 else { return }
+    // 比较普通安全区和角落避让区域，仅传递系统窗口控件额外占用的宽度。
+    let normal = view.edgeInsets(for: .safeArea(cornerAdaptation: .none))
+    let adapted = view.edgeInsets(for: .safeArea(cornerAdaptation: .horizontal))
+    let frame = view.convert(webView.bounds, from: webView)
+    let left = isWindowedIPad && adapted.left > normal.left
+      ? max(0, view.bounds.minX + adapted.left - frame.minX) : 0
+    let right = isWindowedIPad && adapted.right > normal.right
+      ? max(0, frame.maxX - (view.bounds.maxX - adapted.right)) : 0
+    let vertical = view.edgeInsets(for: .safeArea(cornerAdaptation: .vertical))
+    let toolbarHeight = isWindowedIPad ? max(0, vertical.top) : 0
+    let top = max(0, view.bounds.minY + adapted.top - frame.minY)
+    let bottom = max(0, frame.maxY - (view.bounds.maxY - normal.bottom))
+    // 按屏幕像素对齐，避免系统动画中的浮点误差持续触发网页重排。
+    let scale = view.window?.screen.scale ?? 1
+    let values = [left, right, webView.bounds.width, toolbarHeight, top, bottom].map {
+      ($0 * scale).rounded() / scale
+    }
+    let payload = "[" + values.map { String(Double($0)) }.joined(separator: ",") + "]"
+    guard payload != windowControlInsetsPayload else { return }
+    windowControlInsetsPayload = payload
+    webView.evaluateJavaScript("""
+      document.documentElement.setAttribute('data-ios-window-controls', '\(payload)');
+      window.dispatchEvent(new Event('siyuan-ios-window-controls'));
+      """) { [weak self] _, error in
+        if error != nil, self?.windowControlInsetsPayload == payload {
+          self?.windowControlInsetsPayload = nil
+        }
+      }
+  }
+
+  func refreshWindowControlLayout() {
+    guard isViewLoaded, !windowControlLayoutRefreshPending else { return }
+    windowControlLayoutRefreshPending = true
+    // 合并场景回调，保留有效占位缓存，避免重复强制原生布局和网页重排。
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.windowControlLayoutRefreshPending = false
+      self.updateWebViewFrame()
+      self.updateWindowControlInsets()
+    }
+  }
+
 
   override func viewSafeAreaInsetsDidChange() {
     super.viewSafeAreaInsetsDidChange()
@@ -244,6 +312,10 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   override var prefersHomeIndicatorAutoHidden: Bool {
+    if #available(iOS 26.0, *), UIDevice.current.userInterfaceIdiom == .pad {
+      // 由窗口化系统管理底部指示条，不主动请求自动隐藏。
+      return false
+    }
     return UIDevice.current.userInterfaceIdiom == .pad
   }
 
@@ -281,6 +353,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       Iosk.MobileStartKernelFast("ios", Bundle.main.resourcePath, urls[0].path, "")
     case .changeStatusBar:
       let argument = (message.body as! String).split(separator: " ")
+      let previousDarkStyle = isDarkStyle
       if argument.count == 2 && argument[1] == "0" {
         isDarkStyle = false
       } else {
@@ -288,7 +361,9 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       }
       self.view.backgroundColor = UIColor.init(
         hexString: String(argument[0]), isDarkMode: isDarkStyle)
-      setNeedsStatusBarAppearanceUpdate()
+      if previousDarkStyle != isDarkStyle {
+        setNeedsStatusBarAppearanceUpdate()
+      }
     case .setClipboard:
       UIPasteboard.general.string = (message.body as! String)
     case .openLink:
@@ -460,7 +535,12 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       webView.backgroundColor = view.backgroundColor
       webView.scrollView.backgroundColor = view.backgroundColor
       bootWebView = webView
-      view.addSubview(webView)
+      // 启动页覆盖主网页，但不提升到系统窗口控件之上。
+      if ViewController.syWebView.superview === view {
+        view.insertSubview(webView, aboveSubview: ViewController.syWebView)
+      } else {
+        view.insertSubview(webView, at: 0)
+      }
     }
 
     webView.load(URLRequest(url: url))
@@ -886,6 +966,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
         navigateToMainPage()
       }
     } else if webView == ViewController.syWebView {
+      windowControlInsetsPayload = nil
       view.setNeedsLayout()
       cancelWebViewRecovery()
       if isReadyMainPage(webView.url) {
