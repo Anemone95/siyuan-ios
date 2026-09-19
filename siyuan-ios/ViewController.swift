@@ -404,7 +404,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
         // 异步将 ID 回传给 JS
         if let callbackName = callback {
           DispatchQueue.main.async {
-            ViewController.syWebView.evaluateJavaScript((callback ?? "") + "(" + String(id) + ")")
+            ViewController.syWebView.evaluateJavaScript(callbackName + "(" + String(id) + ")")
           }
         }
       }

@@ -84,13 +84,20 @@ class ShorthandViewController: UIViewController {
     // 让标题在取消/提交按钮之间居中
     titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-    submitButton.setTitle(NSLocalizedString("Submit", comment: ""), for: .normal)
+    var submitConfiguration = UIButton.Configuration.plain()
+    submitConfiguration.title = NSLocalizedString("Submit", comment: "")
+    submitConfiguration.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12)
+    submitConfiguration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+      var attributes = attributes
+      attributes.font = UIFont.systemFont(ofSize: 14)
+      return attributes
+    }
+    submitButton.configuration = submitConfiguration
+    submitButton.configurationUpdateHandler = { button in
+      button.configuration?.baseForegroundColor = button.isEnabled ? .white : .lightText
+    }
     submitButton.addTarget(self, action: #selector(onSubmit), for: .touchUpInside)
-    submitButton.setTitleColor(.white, for: .normal)
-    submitButton.setTitleColor(.lightText, for: .disabled)
-    submitButton.titleLabel?.font = UIFont.systemFont(ofSize: 14)
     submitButton.layer.cornerRadius = 6
-    submitButton.contentEdgeInsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
     submitButton.setContentHuggingPriority(.required, for: .horizontal)
     refreshSubmitButton()
 
