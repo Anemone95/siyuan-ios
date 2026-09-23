@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A1B2C3D5E5F6222200020501 /* KernelRecoveryCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D5E5F6222200020502 /* KernelRecoveryCoordinator.swift */; };
 		004F1B3C2F2FF46D006B27B5 /* logo.icon in Resources */ = {isa = PBXBuildFile; fileRef = 004F1B3B2F2FF46D006B27B5 /* logo.icon */; };
 		2605291F443EB855AA534C4D /* ShorthandViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C7EC7DA5CF3CC7C1257D81 /* ShorthandViewController.swift */; };
 		261A2E192D1A5DE100451540 /* libresolv.9.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 261A2E182D1A5DC900451540 /* libresolv.9.tbd */; };
@@ -56,6 +57,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A1B2C3D5E5F6222200020502 /* KernelRecoveryCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KernelRecoveryCoordinator.swift; sourceTree = "<group>"; };
 		004F1B3B2F2FF46D006B27B5 /* logo.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = logo.icon; sourceTree = "<group>"; };
 		261A2E182D1A5DC900451540 /* libresolv.9.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libresolv.9.tbd; path = usr/lib/libresolv.9.tbd; sourceTree = SDKROOT; };
 		2646A9362C3D297B0014E1AC /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/InfoPlist.strings; sourceTree = "<group>"; };
@@ -150,6 +152,7 @@
 				268CE5A1275A68B400DFCFF8 /* AppDelegate.swift */,
 				268CE5A3275A68B400DFCFF8 /* SceneDelegate.swift */,
 				268CE5A5275A68B400DFCFF8 /* ViewController.swift */,
+				A1B2C3D5E5F6222200020502 /* KernelRecoveryCoordinator.swift */,
 				B5C7EC7DA5CF3CC7C1257D81 /* ShorthandViewController.swift */,
 				A1B2C3D5E5F6222200020402 /* ShorthandDraftStore.swift */,
 				A1B2C3D5E5F6222200020002 /* AppearanceResolver.swift */,
@@ -299,6 +302,7 @@
 				A1B2C3D5E5F6222200020401 /* ShorthandDraftStore.swift in Sources */,
 				2675C37D2D8964E300421174 /* IAPManager.swift in Sources */,
 				268CE5A6275A68B400DFCFF8 /* ViewController.swift in Sources */,
+				A1B2C3D5E5F6222200020501 /* KernelRecoveryCoordinator.swift in Sources */,
 				2605291F443EB855AA534C4D /* ShorthandViewController.swift in Sources */,
 				A1B2C3D5E5F6222200020001 /* AppearanceResolver.swift in Sources */,
 				A1B2C3D5E5F6222200020101 /* ShorthandLauncher.swift in Sources */,

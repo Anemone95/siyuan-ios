@@ -108,6 +108,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
 
   deinit {
     // make sure to remove the observer when this view controller is dismissed/deallocated
+    KernelRecoveryCoordinator.shared.detach(ViewController.syWebView, owner: self)
     NotificationCenter.default.removeObserver(self)
     bootProgressMonitorActive = false
     bootProgressTask?.cancel()
@@ -138,6 +139,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     view.backgroundColor = UIColor(
       red: 0x1e / 255.0, green: 0x1e / 255.0, blue: 0x1e / 255.0, alpha: 1)
 
+    KernelRecoveryCoordinator.shared.install(ViewController.syWebView, owner: self)
     initKernel()
 
     ViewController.syWebView.customUserAgent =
@@ -205,20 +207,15 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
 
     // 息屏/应用切换
     NotificationCenter.default.addObserver(
-      self, selector: #selector(willEnterForeground),
-      name: UIApplication.willEnterForegroundNotification, object: nil)
-    NotificationCenter.default.addObserver(
-      self, selector: #selector(willEnterForeground),
-      name: UIApplication.didBecomeActiveNotification, object: nil)
-    NotificationCenter.default.addObserver(
       self, selector: #selector(protectedDataDidBecomeUnavailable),
       name: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil)
-    waitFotKernelHttpServing()
     ViewController.syWebView.isHidden = true
     // 网页置于容器底层，保留系统窗口控件的显示层级。
     view.insertSubview(ViewController.syWebView, at: 0)
-    loadBootPage(url)
-    startBootProgressMonitor()
+    KernelRecoveryCoordinator.shared.whenAccepting { [weak self] in
+      self?.loadBootPage(url)
+      self?.startBootProgressMonitor()
+    }
     #if DEBUG
       if #available(iOS 16.4, *) {
         ViewController.syWebView.isInspectable = true
@@ -349,8 +346,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   ) {
     switch ScriptMessageName(rawValue: message.name) {
     case .startKernelFast:
-      let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-      Iosk.MobileStartKernelFast("ios", Bundle.main.resourcePath, urls[0].path, "")
+      KernelRecoveryCoordinator.shared.retry(message)
     case .changeStatusBar:
       let argument = (message.body as! String).split(separator: " ")
       let previousDarkStyle = isDarkStyle
@@ -391,8 +387,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     case .print:
       printDynamicHTML(message.body as! String)
     case .exit:
-      UIApplication.shared.perform(#selector(NSXPCConnection.suspend))
-      exit(0)
+      KernelRecoveryCoordinator.shared.exitKernel()
     case .sendNotification:
       let dict = message.body as? [String: Any]
       let channel = dict!["channel"] as? String ?? "default"
@@ -498,7 +493,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
 
   func initKernel() {
     let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-    Iosk.MobileStartKernel(
+    Iosk.MobileStartKernelWithRecovery(
       "ios", Bundle.main.resourcePath, urls[0].path, TimeZone.current.identifier, getIP(),
       Locale.preferredLanguages[0].prefix(2) == "zh" ? "zh-CN" : "en",
       UIDevice.current.systemVersion)
@@ -933,6 +928,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+    KernelRecoveryCoordinator.shared.invalidatePage(webView)
     guard let url = webView.url,
       isLocalKernelURL(url), !url.path.contains("/appearance/boot/")
     else {
@@ -953,6 +949,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    KernelRecoveryCoordinator.shared.navigationFinished(webView)
     if webView == bootWebView {
       cancelWebViewRecovery()
       if let url = webView.url, isLocalKernelURL(url),
@@ -1004,6 +1001,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    KernelRecoveryCoordinator.shared.invalidatePage(webView)
     guard webView == ViewController.syWebView || webView == bootWebView else {
       return
     }
