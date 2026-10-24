@@ -64,8 +64,17 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   private var textMenuVisible = false
   private var textMenuRequestGeneration: UInt = 0
   private var textMenuRect = CGRect.zero
+  // 部署目标低于 iOS 16，存储属性不能按系统版本标注，交互对象在首次访问时创建。
+  private var textMenuInteractionStorage: AnyObject?
   @available(iOS 16.0, *)
-  private lazy var textMenuInteraction = UIEditMenuInteraction(delegate: self)
+  private var textMenuInteraction: UIEditMenuInteraction {
+    if let interaction = textMenuInteractionStorage as? UIEditMenuInteraction {
+      return interaction
+    }
+    let interaction = UIEditMenuInteraction(delegate: self)
+    textMenuInteractionStorage = interaction
+    return interaction
+  }
   private var photoPickerReply: ((Any?, String?) -> Void)?
   private var photoPickerRequestID: UUID?
   private var photoPickerTask: Task<Void, Never>?
