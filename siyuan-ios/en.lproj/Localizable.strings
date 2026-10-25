@@ -2,8 +2,17 @@
 "shorthand_label" = "Flash Shorthand";
 "shorthand_storage_error" = "Unable to save the shorthand. Please try again.";
 "Submit" = "Submit";
+"Saved" = "✓";
+"SavedAccessibility" = "Saved";
 "Cancel" = "Cancel";
 "OK" = "OK";
 "Paste" = "Paste";
 "shorthand_intent_description" = "Open SiYuan shorthand to capture a quick note";
 "shorthand_intent_content_param" = "Content";
+"startupFailed" = "SiYuan failed to start";
+"startupStage" = "Failed stage: ${stage}";
+"startupStagePage" = "Loading the page";
+"startupReload" = "Reload";
+"startupCopy" = "Copy error details";
+"startupCopied" = "Copied";
+"startupTimeout" = "Startup timed out";

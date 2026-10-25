@@ -20,7 +20,10 @@ import AuthenticationServices
 import GameController
 import Iosk
 import PDFKit
+import Photos
+import PhotosUI
 import UIKit
+import UniformTypeIdentifiers
 import WebKit
 
 private enum ScriptMessageName: String {
@@ -37,10 +40,13 @@ private enum ScriptMessageName: String {
   case cancelNotification
   case vibrate
   case openAuthURL
+  case finishKeyboardComposition
+  case showTextMenu
+  case pickPhotos
 }
 
 class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelegate,
-  WKScriptMessageHandler, UIPrintInteractionControllerDelegate,
+  WKScriptMessageHandler, WKScriptMessageHandlerWithReply, UIPrintInteractionControllerDelegate,
   ASWebAuthenticationPresentationContextProviding
 {
 
@@ -51,9 +57,28 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   var keyboardShowed = false
   var keyboardEndFrame: CGRect?
   var isOrientationTransitioning = false
-  var isDarkStyle = false
+  var isDarkStyle = true
+  private var pendingStatusBarAppearance: (color: UIColor, isDark: Bool)?
   private var windowControlInsetsPayload: String?
   private var windowControlLayoutRefreshPending = false
+  private var textMenuVisible = false
+  private var textMenuRequestGeneration: UInt = 0
+  private var textMenuRect = CGRect.zero
+  // 部署目标低于 iOS 16，存储属性不能按系统版本标注，交互对象在首次访问时创建。
+  private var textMenuInteractionStorage: AnyObject?
+  @available(iOS 16.0, *)
+  private var textMenuInteraction: UIEditMenuInteraction {
+    if let interaction = textMenuInteractionStorage as? UIEditMenuInteraction {
+      return interaction
+    }
+    let interaction = UIEditMenuInteraction(delegate: self)
+    textMenuInteractionStorage = interaction
+    return interaction
+  }
+  private var photoPickerReply: ((Any?, String?) -> Void)?
+  private var photoPickerRequestID: UUID?
+  private var photoPickerTask: Task<Void, Never>?
+  private var photoPickerTimeout: DispatchWorkItem?
   @available(iOS 26.0, *)
   private var isWindowedIPad: Bool {
     guard let window = view.window, let scene = window.windowScene,
@@ -97,6 +122,9 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   private var mainPageWatchdog: DispatchWorkItem?
   private var mainPageWatchdogGeneration = 0
   private static let mainPageLoadTimeout: TimeInterval = 30
+  private var startupFailureView: UIView?
+  private var startupStartedAt = Date()
+  private var mainPageStartupStage = ""
 
   required init(coder: NSCoder) {
     super.init(coder: coder)!
@@ -133,11 +161,10 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       return
     }
 
-    // 启动/加载阶段 webview 显示的 boot/index.html 与 #loading 蒙层背景恒为深色 #1e1e1e，
-    // 故顶/底条初始也用同色与之衔接；待 webview 完全启动、changeStatusBar 回调到达后
-    // 再由其按思源主题精修为精确主题色与状态栏样式。
-    view.backgroundColor = UIColor(
+    // 启动阶段使用与启动屏和内核启动页一致的深色，正文就绪后再应用所选主题。
+    let startupColor = UIColor(
       red: 0x1e / 255.0, green: 0x1e / 255.0, blue: 0x1e / 255.0, alpha: 1)
+    applyStatusBarAppearance(color: startupColor, isDark: true)
 
     KernelRecoveryCoordinator.shared.install(ViewController.syWebView, owner: self)
     initKernel()
@@ -177,22 +204,26 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       self, name: ScriptMessageName.vibrate.rawValue)
     ViewController.syWebView.configuration.userContentController.add(
       self, name: ScriptMessageName.openAuthURL.rawValue)
+    ViewController.syWebView.configuration.userContentController.addScriptMessageHandler(
+      self, contentWorld: .page, name: ScriptMessageName.finishKeyboardComposition.rawValue)
+    ViewController.syWebView.configuration.userContentController.addScriptMessageHandler(
+      self, contentWorld: .page, name: ScriptMessageName.showTextMenu.rawValue)
+    ViewController.syWebView.configuration.userContentController.addScriptMessageHandler(
+      self, contentWorld: .page, name: ScriptMessageName.pickPhotos.rawValue)
 
-    // open url
     ViewController.syWebView.navigationDelegate = self
+    if #available(iOS 16.0, *) {
+      ViewController.syWebView.addInteraction(textMenuInteraction)
+    }
 
     // show keyboard
     ViewController.syWebView.scrollView.isScrollEnabled = false
     ViewController.syWebView.scrollView.contentInsetAdjustmentBehavior = .never
     ViewController.syWebView.scrollView.delegate = self
-    // boot 页与 index 的 #loading 蒙层背景恒为深色 #1e1e1e，故 webview 及其滚动视图底色
-    // 也固定为深色，避免 HTML/CSS 渲染前露出默认白底。webview 内容（body 背景不透明）会
-    // 完全覆盖此底色；顶/底条由 changeStatusBar 回调按主题精修。
+    // 网页透明区域与原生安全区使用同一底色。
     ViewController.syWebView.isOpaque = false
-    ViewController.syWebView.backgroundColor = UIColor(
-      red: 0x1e / 255.0, green: 0x1e / 255.0, blue: 0x1e / 255.0, alpha: 1)
-    ViewController.syWebView.scrollView.backgroundColor = UIColor(
-      red: 0x1e / 255.0, green: 0x1e / 255.0, blue: 0x1e / 255.0, alpha: 1)
+    ViewController.syWebView.backgroundColor = view.backgroundColor
+    ViewController.syWebView.scrollView.backgroundColor = view.backgroundColor
     NotificationCenter.default.addObserver(
       self, selector: #selector(keyboardWillChange),
       name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
@@ -206,6 +237,12 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       object: nil)
 
     // 息屏/应用切换
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(suspendStartupMonitoring),
+      name: UIApplication.didEnterBackgroundNotification, object: nil)
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(resumeStartupMonitoring),
+      name: UIApplication.willEnterForegroundNotification, object: nil)
     NotificationCenter.default.addObserver(
       self, selector: #selector(protectedDataDidBecomeUnavailable),
       name: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil)
@@ -324,6 +361,39 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     return isDarkStyle ? .lightContent : .darkContent
   }
 
+  private func applyStatusBarAppearance(color: UIColor, isDark: Bool) {
+    let previousDarkStyle = isDarkStyle
+    isDarkStyle = isDark
+    view.backgroundColor = color
+    ViewController.syWebView.backgroundColor = color
+    ViewController.syWebView.scrollView.backgroundColor = color
+    if previousDarkStyle != isDarkStyle {
+      setNeedsStatusBarAppearanceUpdate()
+    }
+  }
+
+  private func installStartupAppearance(in webView: WKWebView) {
+    var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 1
+    (view.backgroundColor ?? .systemBackground).resolvedColor(with: traitCollection)
+      .getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+    let color = "rgb(\(Int(red * 255)),\(Int(green * 255)),\(Int(blue * 255)))"
+    let marker = "/* siyuan-native-startup-appearance */"
+    let source = """
+      \(marker)
+      (() => {
+        const style = document.createElement('style');
+        style.id = 'siyuan-native-startup-appearance';
+        style.textContent = 'html, body, #loading .b3-dialog__scrim { background-color: \(color) !important; }';
+        document.documentElement.appendChild(style);
+      })();
+      """
+    let controller = webView.configuration.userContentController
+    let retained = controller.userScripts.filter { !$0.source.hasPrefix(marker) }
+    controller.removeAllUserScripts()
+    retained.forEach { controller.addUserScript($0) }
+    controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+  }
+
   func scrollViewDidScroll(_ scrollView: UIScrollView) {
     guard #available(iOS 26.0, *), scrollView === ViewController.syWebView.scrollView,
       scrollView.contentOffset != .zero
@@ -342,23 +412,154 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   func userContentController(
+    _ userContentController: WKUserContentController, didReceive message: WKScriptMessage,
+    replyHandler: @escaping (Any?, String?) -> Void
+  ) {
+    guard message.webView === ViewController.syWebView, message.frameInfo.isMainFrame else {
+      replyHandler(nil, "Unsupported native bridge source")
+      return
+    }
+    if message.name == ScriptMessageName.finishKeyboardComposition.rawValue {
+      finishKeyboardComposition(message, replyHandler: replyHandler)
+    } else if message.name == ScriptMessageName.showTextMenu.rawValue {
+      guard let expectedText = message.body as? String,
+        let url = ViewController.syWebView.url,
+        ["127.0.0.1", "localhost", "::1"].contains(url.host ?? ""),
+        message.frameInfo.securityOrigin.host == url.host,
+        message.frameInfo.securityOrigin.protocol == url.scheme,
+        message.frameInfo.securityOrigin.port == (url.port ?? 80),
+        url.path.hasPrefix("/stage/build/")
+      else {
+        replyHandler(false, nil)
+        return
+      }
+      if expectedText.isEmpty {
+        textMenuRequestGeneration &+= 1
+        if #available(iOS 16.0, *) {
+          textMenuInteraction.dismissMenu()
+        } else {
+          UIMenuController.shared.hideMenu()
+        }
+        replyHandler(true, nil)
+      } else {
+        showNativeTextMenu(expectedText: expectedText, replyHandler: replyHandler)
+      }
+    } else if message.name == ScriptMessageName.pickPhotos.rawValue {
+      guard let url = ViewController.syWebView.url,
+        ["127.0.0.1", "localhost", "::1"].contains(url.host ?? ""),
+        message.frameInfo.securityOrigin.host == url.host,
+        message.frameInfo.securityOrigin.protocol == url.scheme,
+        message.frameInfo.securityOrigin.port == (url.port ?? 80),
+        url.path.hasPrefix("/stage/build/")
+      else {
+        replyHandler(nil, "Unsupported photo picker source")
+        return
+      }
+      pickPhotos(replyHandler: replyHandler)
+    } else {
+      replyHandler(nil, "Unknown native bridge message")
+    }
+  }
+
+  private func showNativeTextMenu(expectedText: String, replyHandler: @escaping (Any?, String?) -> Void) {
+    textMenuRequestGeneration &+= 1
+    let generation = textMenuRequestGeneration
+    let webView = ViewController.syWebView
+    guard webView.window != nil, presentedViewController == nil else {
+      replyHandler(false, nil)
+      return
+    }
+    // 在原生菜单显示前重新读取选区，避免延迟请求使用已经切换的文字位置。
+    webView.evaluateJavaScript("""
+      (() => {
+        const selection = getSelection();
+        if (!selection?.rangeCount || selection.isCollapsed || !selection.toString().trim()) return null;
+        const range = selection.getRangeAt(0);
+        const element = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+        const editor = element?.closest('.protyle-wysiwyg');
+        if (!editor?.contains(range.endContainer) || !editor.contains(document.activeElement)) return null;
+        const rect = range.getBoundingClientRect();
+        return {text: selection.toString(), x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+      })()
+      """) { [weak self] result, error in
+      guard let self = self, self.textMenuRequestGeneration == generation,
+        error == nil, let value = result as? [String: Any],
+        value["text"] as? String == expectedText,
+        let x = value["x"] as? Double, let y = value["y"] as? Double,
+        let width = value["width"] as? Double, let height = value["height"] as? Double,
+        [x, y, width, height].allSatisfy({ $0.isFinite }), width > 0, height > 0
+      else {
+        replyHandler(false, nil)
+        return
+      }
+      let rect = CGRect(x: x, y: y, width: width, height: height)
+      guard webView.window != nil, rect.intersects(webView.bounds) else {
+        replyHandler(false, nil)
+        return
+      }
+      if #available(iOS 16.0, *) {
+        self.textMenuRect = rect
+        if self.textMenuVisible {
+          self.textMenuInteraction.updateVisibleMenuPosition(animated: false)
+        } else {
+          self.textMenuInteraction.presentEditMenu(with: UIEditMenuConfiguration(
+            identifier: nil, sourcePoint: CGPoint(x: rect.midX, y: rect.midY)))
+        }
+      } else {
+        UIMenuController.shared.showMenu(from: webView, rect: rect)
+      }
+      replyHandler(true, nil)
+    }
+  }
+
+  private func pickPhotos(replyHandler: @escaping (Any?, String?) -> Void) {
+    guard photoPickerReply == nil, presentedViewController == nil else {
+      replyHandler(nil, "Photo picker is busy")
+      return
+    }
+    photoPickerReply = replyHandler
+    photoPickerRequestID = UUID()
+    var configuration = PHPickerConfiguration()
+    configuration.filter = .images
+    configuration.selectionLimit = 10
+    configuration.preferredAssetRepresentationMode = .current
+    configuration.selection = .ordered
+    let picker = PHPickerViewController(configuration: configuration)
+    picker.delegate = self
+    present(picker, animated: true)
+  }
+
+  private func finishPhotoPicker(_ files: [[String: String]]?, error: String?, requestID: UUID) {
+    guard photoPickerRequestID == requestID else { return }
+    photoPickerTimeout?.cancel()
+    photoPickerTimeout = nil
+    photoPickerTask?.cancel()
+    photoPickerTask = nil
+    let reply = photoPickerReply
+    photoPickerReply = nil
+    photoPickerRequestID = nil
+    reply?(files, error)
+  }
+
+  func userContentController(
     _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
   ) {
     switch ScriptMessageName(rawValue: message.name) {
     case .startKernelFast:
       KernelRecoveryCoordinator.shared.retry(message)
     case .changeStatusBar:
-      let argument = (message.body as! String).split(separator: " ")
-      let previousDarkStyle = isDarkStyle
-      if argument.count == 2 && argument[1] == "0" {
-        isDarkStyle = false
+      guard let value = message.body as? String else { return }
+      let argument = value.split(separator: " ")
+      guard let hexColor = argument.first else { return }
+      let isDark = !(argument.count == 2 && argument[1] == "0")
+      guard let color = UIColor(hexString: String(hexColor), isDarkMode: isDark) else { return }
+      ViewController.syWebView.evaluateJavaScript(
+        "document.getElementById('siyuan-native-startup-appearance')?.remove()", completionHandler: nil)
+      if bootWebView != nil {
+        // 启动页仍覆盖正文时暂存主题，避免状态栏提前切换为认证页或编辑器的底色。
+        pendingStatusBarAppearance = (color, isDark)
       } else {
-        isDarkStyle = true
-      }
-      self.view.backgroundColor = UIColor.init(
-        hexString: String(argument[0]), isDarkMode: isDarkStyle)
-      if previousDarkStyle != isDarkStyle {
-        setNeedsStatusBarAppearanceUpdate()
+        applyStatusBarAppearance(color: color, isDark: isDark)
       }
     case .setClipboard:
       UIPasteboard.general.string = (message.body as! String)
@@ -429,6 +630,47 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     }
   }
 
+  private func finishKeyboardComposition(
+    _ message: WKScriptMessage,
+    replyHandler: @escaping (Any?, String?) -> Void
+  ) {
+    if message.body as? String == "restore" {
+      ViewController.syWebView.evaluateJavaScript("""
+        (() => {
+          const input = document.activeElement;
+          if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) return false;
+          const start = input.selectionStart, end = input.selectionEnd;
+          input.blur();
+          input.focus({preventScroll: true});
+          input.setSelectionRange(start, end);
+          return document.activeElement === input;
+        })()
+        """) { result, error in
+          replyHandler(result as? Bool ?? false, error?.localizedDescription)
+        }
+      return
+    }
+    func finishComposition(in view: UIView) -> Bool {
+      if view.isFirstResponder, let input = view as? UITextInput {
+        input.inputDelegate?.textWillChange(input)
+        input.inputDelegate?.selectionWillChange(input)
+        input.unmarkText()
+        input.inputDelegate?.selectionDidChange(input)
+        input.inputDelegate?.textDidChange(input)
+        // 快捷键的候选可能仍保留在系统输入会话中，网页恢复搜索框焦点时重新建立会话。
+        view.resignFirstResponder()
+        return true
+      }
+      for child in view.subviews {
+        if finishComposition(in: child) { return true }
+      }
+      return false
+    }
+    // 结束系统输入法的组词，再通知网页恢复搜索词，保留外接键盘的输入焦点。
+    let finished = finishComposition(in: ViewController.syWebView)
+    DispatchQueue.main.async { replyHandler(finished, nil) }
+  }
+
   func webView(
     _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
@@ -438,8 +680,21 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       return
     }
 
+    if webView === ViewController.syWebView, navigationAction.targetFrame?.isMainFrame == true,
+      isLocalKernelURL(url) {
+      installStartupAppearance(in: webView)
+    }
+
+    if webView === ViewController.syWebView, navigationAction.shouldPerformDownload,
+      let assetPath = localAssetDownloadPath(url)
+    {
+      decisionHandler(.cancel)
+      saveExportFile(uri: assetPath, requestID: "")
+      return
+    }
+
     if webView === bootWebView, navigationAction.targetFrame?.isMainFrame == true,
-      isLocalKernelURL(url), !url.path.contains("/appearance/boot/")
+      isLocalKernelURL(url), !isBootDocument(url)
     {
       decisionHandler(.cancel)
       bootProgressMonitorActive = false
@@ -476,6 +731,18 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     _ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
     decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
   ) {
+    if webView === ViewController.syWebView,
+      let response = navigationResponse.response as? HTTPURLResponse,
+      (200..<300).contains(response.statusCode),
+      response.value(forHTTPHeaderField: "Content-Disposition")?.lowercased()
+        .hasPrefix("attachment") == true,
+      let url = response.url, let assetPath = localAssetDownloadPath(url)
+    {
+      decisionHandler(.cancel)
+      saveExportFile(uri: assetPath, requestID: "")
+      return
+    }
+
     guard (webView == ViewController.syWebView || webView == bootWebView),
       navigationResponse.isForMainFrame,
       let response = navigationResponse.response as? HTTPURLResponse, response.statusCode >= 400
@@ -513,6 +780,8 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     mainPageNavigationStarted = false
     mainPageReady = false
 
+    pendingStatusBarAppearance = nil
+
     let webView: WKWebView
     if let currentBootWebView = bootWebView {
       webView = currentBootWebView
@@ -538,6 +807,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       }
     }
 
+    installStartupAppearance(in: webView)
     webView.load(URLRequest(url: url))
   }
 
@@ -546,6 +816,10 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     bootWebView?.navigationDelegate = nil
     bootWebView?.removeFromSuperview()
     bootWebView = nil
+    if let appearance = pendingStatusBarAppearance {
+      pendingStatusBarAppearance = nil
+      applyStatusBarAppearance(color: appearance.color, isDark: appearance.isDark)
+    }
   }
 
   private func startBootProgressMonitor() {
@@ -623,6 +897,177 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     ViewController.syWebView.load(URLRequest(url: url))
   }
 
+  // 从随程序打包的小型语言表读取启动文案，不依赖 HTTP 或前端语言包初始化。
+  private func startupStrings() -> [String: String] {
+    let fallback = [
+      "startupFailed": NSLocalizedString("startupFailed", comment: "启动失败标题"),
+      "startupStage": NSLocalizedString("startupStage", comment: "启动失败阶段"),
+      "startupStagePage": NSLocalizedString("startupStagePage", comment: "加载页面"),
+      "startupReload": NSLocalizedString("startupReload", comment: "重新加载"),
+      "startupCopy": NSLocalizedString("startupCopy", comment: "复制错误信息"),
+      "copied": NSLocalizedString("startupCopied", comment: "已复制"),
+      "startupTimeout": NSLocalizedString("startupTimeout", comment: "启动超时"),
+    ]
+    guard let resources = Bundle.main.resourceURL,
+      let data = try? Data(contentsOf: resources.appendingPathComponent("app/appearance/boot/startup-languages.json")),
+      let translations = try? JSONSerialization.jsonObject(with: data) as? [String: [String: String]]
+    else { return fallback }
+    var preferred = Locale.preferredLanguages
+    if let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+      var workspace = documents.appendingPathComponent("siyuan")
+      if let data = try? Data(contentsOf: documents.appendingPathComponent("home/.config/siyuan/workspace.json")),
+        let paths = try? JSONSerialization.jsonObject(with: data) as? [String], let last = paths.last {
+        workspace = URL(fileURLWithPath: last, isDirectory: true)
+      }
+      if let data = try? Data(contentsOf: workspace.appendingPathComponent("conf/conf.json")),
+        let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let language = config["lang"] as? String {
+        preferred.insert(language, at: 0)
+      }
+    }
+    for language in preferred {
+      let normalized = language.replacingOccurrences(of: "_", with: "-").lowercased()
+      if let key = translations.keys.first(where: { $0.lowercased() == normalized }) {
+        return translations[key] ?? fallback
+      }
+      if normalized.hasPrefix("zh") {
+        let traditional = ["hant", "tw", "hk", "mo"].contains(where: { normalized.contains($0) })
+        return translations[traditional ? "zh-TW" : "zh-CN"] ?? fallback
+      }
+      let base = String(normalized.split(separator: "-").first ?? "en")
+      if let strings = translations[base == "pt" ? "pt-BR" : base] { return strings }
+    }
+    return translations["en"] ?? fallback
+  }
+
+  private func showStartupFailure(_ error: String) {
+    guard startupFailureView == nil else { return }
+    cancelMainPageWatchdog()
+    cancelWebViewRecovery()
+    bootProgressMonitorActive = false
+    bootProgressTask?.cancel()
+    removeBootWebView()
+    let strings = startupStrings()
+    let stage = mainPageStartupStage.isEmpty ? "page" : mainPageStartupStage
+    let phaseKey = "startupStage" + stage.prefix(1).uppercased() + String(stage.dropFirst())
+    let details = "SiYuan \(getAppVersion())\niOS \(UIDevice.current.systemVersion)\nstage=\(stage)\n\n\(error)"
+    let overlay = UIView()
+    overlay.backgroundColor = .systemBackground
+    overlay.translatesAutoresizingMaskIntoConstraints = false
+    let title = UILabel()
+    title.text = strings["startupFailed"]
+    title.font = .preferredFont(forTextStyle: .title2)
+    title.adjustsFontForContentSizeCategory = true
+    title.numberOfLines = 0
+    title.accessibilityTraits.insert(.header)
+    let phase = UILabel()
+    phase.text = strings["startupStage"]?.replacingOccurrences(
+      of: "${stage}", with: strings[phaseKey] ?? strings["startupStagePage"] ?? stage)
+    phase.font = .preferredFont(forTextStyle: .body)
+    phase.adjustsFontForContentSizeCategory = true
+    phase.numberOfLines = 0
+    let information = UITextView()
+    information.text = details
+    information.isEditable = false
+    information.font = .preferredFont(forTextStyle: .body)
+    information.adjustsFontForContentSizeCategory = true
+    let reload = UIButton(type: .system)
+    reload.titleLabel?.numberOfLines = 0
+    reload.titleLabel?.font = .preferredFont(forTextStyle: .body)
+    reload.titleLabel?.adjustsFontForContentSizeCategory = true
+    reload.setTitle(strings["startupReload"], for: .normal)
+    reload.addAction(UIAction { [weak self] _ in
+      guard let self = self else { return }
+      self.startupFailureView?.removeFromSuperview()
+      self.startupFailureView = nil
+      self.startupStartedAt = Date()
+      self.mainPageReady = false
+      self.mainPageNavigationStarted = false
+      if self.kernelBootCompleted {
+        self.navigateToMainPage()
+      } else {
+        self.loadBootPage()
+        self.startBootProgressMonitor()
+      }
+    }, for: .touchUpInside)
+    let copy = UIButton(type: .system)
+    copy.titleLabel?.numberOfLines = 0
+    copy.titleLabel?.font = .preferredFont(forTextStyle: .body)
+    copy.titleLabel?.adjustsFontForContentSizeCategory = true
+    copy.setTitle(strings["startupCopy"], for: .normal)
+    copy.addAction(UIAction { [weak copy] _ in
+      UIPasteboard.general.string = details
+      copy?.setTitle(strings["copied"], for: .normal)
+    }, for: .touchUpInside)
+    let content = UIStackView(arrangedSubviews: [title, phase, information, reload, copy])
+    content.axis = .vertical
+    content.spacing = 16
+    content.translatesAutoresizingMaskIntoConstraints = false
+    let scroll = UIScrollView()
+    scroll.translatesAutoresizingMaskIntoConstraints = false
+    scroll.addSubview(content)
+    overlay.addSubview(scroll)
+    view.addSubview(overlay)
+    NSLayoutConstraint.activate([
+      overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      overlay.topAnchor.constraint(equalTo: view.topAnchor),
+      overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      scroll.leadingAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+      scroll.trailingAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+      scroll.topAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.topAnchor, constant: 24),
+      scroll.bottomAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+      content.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+      content.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+      content.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+      content.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+      content.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
+      information.heightAnchor.constraint(equalToConstant: 240),
+      reload.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+      copy.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+    ])
+    startupFailureView = overlay
+    UIAccessibility.post(notification: .screenChanged, argument: title)
+  }
+
+  // 网页导航完成后继续检查前端状态；错误页自行提供重试入口，认证页可直接交互。
+  private func pollMainPageReadiness(_ generation: Int) {
+    guard mainPageWatchdogGeneration == generation, startupFailureView == nil else { return }
+    ViewController.syWebView.evaluateJavaScript("""
+      ({ready: Boolean(window.siyuan && window.siyuan.isReady) || location.pathname === '/check-auth',
+        failed: document.documentElement.getAttribute('data-startup-state') === 'failed',
+        stage: document.documentElement.getAttribute('data-startup-stage') || ''})
+      """) { [weak self] value, _ in
+      guard let self = self, self.mainPageWatchdogGeneration == generation,
+        self.startupFailureView == nil else { return }
+      if let result = value as? [String: Any] {
+        if result["ready"] as? Bool == true || result["failed"] as? Bool == true {
+          self.mainPageReady = result["ready"] as? Bool == true
+          self.removeBootWebView()
+          self.cancelMainPageWatchdog()
+          return
+        }
+        if let stage = result["stage"] as? String, !stage.isEmpty, stage != self.mainPageStartupStage {
+          self.mainPageStartupStage = stage
+          self.scheduleMainPageWatchdog()
+          return
+        }
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+        self?.pollMainPageReadiness(generation)
+      }
+    }
+  }
+
+  // 保留 URL 中的目录末尾斜杠，识别静态文件服务的 index.html 重定向。
+  private func isBootDocument(_ url: URL?) -> Bool {
+    guard let url = url, url.scheme == "http", url.host == "127.0.0.1", url.port == 6806,
+      url.user == nil, url.password == nil,
+      let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    else { return false }
+    return ["/appearance/boot/", "/appearance/boot/index.html"].contains(components.percentEncodedPath)
+  }
+
   private func isReadyMainPage(_ url: URL?) -> Bool {
     guard let url = url, isLocalKernelURL(url) else {
       return false
@@ -632,6 +1077,19 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
 
   private func isLocalKernelURL(_ url: URL) -> Bool {
     return url.scheme == "http" && url.host == "127.0.0.1" && url.port == 6806
+  }
+
+  // 保留资源路径编码和笔记本参数，供现有导出租约解析。
+  private func localAssetDownloadPath(_ url: URL) -> String? {
+    guard isLocalKernelURL(url), url.user == nil, url.password == nil,
+      let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+      components.percentEncodedPath.hasPrefix("/assets/"),
+      components.percentEncodedPath.count > "/assets/".count
+    else {
+      return nil
+    }
+    let path = String(components.percentEncodedPath.dropFirst())
+    return path + (components.percentEncodedQuery.map { "?" + $0 } ?? "")
   }
 
   private func scheduleMainPageWatchdog() {
@@ -652,14 +1110,16 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
         return
       }
 
-      print("Main page load timed out, reload it")
-      ViewController.syWebView.stopLoading()
-      self.mainPageNavigationStarted = false
-      self.navigateToMainPage()
+      if UIApplication.shared.applicationState != .active {
+        self.scheduleMainPageWatchdog()
+        return
+      }
+      self.showStartupFailure(self.startupStrings()["startupTimeout"] ?? NSLocalizedString("startupTimeout", comment: "启动超时"))
     }
     mainPageWatchdog = watchdog
     DispatchQueue.main.asyncAfter(
       deadline: .now() + ViewController.mainPageLoadTimeout, execute: watchdog)
+    pollMainPageReadiness(generation)
   }
 
   private func cancelMainPageWatchdog() {
@@ -668,12 +1128,29 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     mainPageWatchdog = nil
   }
 
-  private func scheduleWebViewRecovery(error: Error? = nil) {
+  @objc private func suspendStartupMonitoring() {
+    cancelMainPageWatchdog()
+  }
+
+  // 内核恢复由恢复协调器处理，回到前台只重新计时主界面启动监测。
+  @objc private func resumeStartupMonitoring() {
+    if kernelBootCompleted && !mainPageReady && startupFailureView == nil {
+      scheduleMainPageWatchdog()
+    }
+  }
+
+  private func scheduleWebViewRecovery(error: Error? = nil, recoverLoadedPage: Bool = false) {
     if let error = error {
       let nsError = error as NSError
       if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
         return
       }
+    }
+    if !recoverLoadedPage && (kernelBootCompleted || Iosk.MobileIsHttpServing()
+      || Date().timeIntervalSince(startupStartedAt) >= 30) {
+      showStartupFailure(error?.localizedDescription ?? startupStrings()["startupTimeout"]
+        ?? NSLocalizedString("startupTimeout", comment: "启动超时"))
+      return
     }
     guard !webViewRecoveryScheduled else {
       return
@@ -705,15 +1182,6 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   private func cancelWebViewRecovery() {
     webViewRecoveryGeneration += 1
     webViewRecoveryScheduled = false
-  }
-
-  func waitFotKernelHttpServing() {
-    for _ in 1...500 {
-      usleep(100000)  // 0.1s
-      if Iosk.MobileIsHttpServing() {
-        break
-      }
-    }
   }
 
   func getIP() -> String? {
@@ -828,8 +1296,8 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     keyboardShowed = false
     keyboardEndFrame = nil
     updateWebViewFrame()
-    ViewController.syWebView.evaluateJavaScript(
-      "document.activeElement && document.activeElement.blur();hideKeyboardToolbar()")
+    // 键盘收起通知可能晚于弹窗的焦点切换，仅更新工具栏，保留当前控件的键盘焦点。
+    ViewController.syWebView.evaluateJavaScript("hideKeyboardToolbar()")
   }
 
   private func updateWebViewFrame() {
@@ -888,6 +1356,9 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   @objc func willEnterForeground(_ notification: NSNotification!) {
+    if kernelBootCompleted && !mainPageReady && startupFailureView == nil {
+      scheduleMainPageWatchdog()
+    }
     // iOS 端息屏后内核退出，再次进入时重新拉起内核
     let url = URL(string: "http://127.0.0.1:6806/api/system/version")!
     let task = URLSession.shared.dataTask(with: url) { (data, response, error) in
@@ -930,7 +1401,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
     KernelRecoveryCoordinator.shared.invalidatePage(webView)
     guard let url = webView.url,
-      isLocalKernelURL(url), !url.path.contains("/appearance/boot/")
+      isLocalKernelURL(url), !isBootDocument(url)
     else {
       return
     }
@@ -945,6 +1416,8 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     } else if webView == ViewController.syWebView {
       mainPageNavigationStarted = true
       mainPageReady = false
+      mainPageStartupStage = ""
+      scheduleMainPageWatchdog()
     }
   }
 
@@ -953,7 +1426,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     if webView == bootWebView {
       cancelWebViewRecovery()
       if let url = webView.url, isLocalKernelURL(url),
-        !url.path.contains("/appearance/boot/")
+        !isBootDocument(url)
       {
         bootProgressMonitorActive = false
         bootProgressTask?.cancel()
@@ -972,9 +1445,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
         bootProgressTask = nil
         kernelBootCompleted = true
         mainPageNavigationStarted = true
-        mainPageReady = true
         forceDefaultBootAppearance = false
-        cancelMainPageWatchdog()
         removeBootWebView()
       }
       ViewController.flushOIDCCallback()
@@ -1005,10 +1476,11 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     guard webView == ViewController.syWebView || webView == bootWebView else {
       return
     }
+    let recoverLoadedPage = mainPageReady
     forceDefaultBootAppearance = !kernelBootCompleted
     mainPageNavigationStarted = false
     mainPageReady = false
-    scheduleWebViewRecovery()
+    scheduleWebViewRecovery(recoverLoadedPage: recoverLoadedPage)
   }
 
   private func initiatePrintInteraction() {
@@ -1275,6 +1747,239 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 }
 
+private enum PhotoPickerError: Error {
+  case unavailable
+  case tooLarge
+  case cancelled
+}
+
+// 将加载完成和取消汇合到一次 continuation 恢复，兼容 Progress 晚于取消返回。
+private final class PhotoProviderLoad<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<Value, Error>?
+  private var pendingResult: Result<Value, Error>?
+  private var progress: Progress?
+  private var completed = false
+  private var cancelled = false
+
+  func setContinuation(_ continuation: CheckedContinuation<Value, Error>) -> Bool {
+    lock.lock()
+    if completed {
+      let result = pendingResult!
+      pendingResult = nil
+      lock.unlock()
+      continuation.resume(with: result)
+      return false
+    }
+    self.continuation = continuation
+    lock.unlock()
+    return true
+  }
+
+  func setProgress(_ progress: Progress) {
+    lock.lock()
+    let shouldCancel = cancelled
+    if !completed { self.progress = progress }
+    lock.unlock()
+    if shouldCancel { progress.cancel() }
+  }
+
+  func finish(_ result: Result<Value, Error>) {
+    lock.lock()
+    guard !completed else {
+      lock.unlock()
+      return
+    }
+    completed = true
+    let continuation = self.continuation
+    self.continuation = nil
+    progress = nil
+    if continuation == nil { pendingResult = result }
+    lock.unlock()
+    continuation?.resume(with: result)
+  }
+
+  func cancel() {
+    lock.lock()
+    guard !completed else {
+      lock.unlock()
+      return
+    }
+    completed = true
+    cancelled = true
+    let progress = self.progress
+    let continuation = self.continuation
+    self.progress = nil
+    self.continuation = nil
+    if continuation == nil { pendingResult = .failure(CancellationError()) }
+    lock.unlock()
+    progress?.cancel()
+    continuation?.resume(throwing: CancellationError())
+  }
+}
+
+// PhotoKit 分段交付原始资源，超过上限或取消时及时停止下载，不创建应用明文临时文件。
+private final class PhotoResourceRead: @unchecked Sendable {
+  private let lock = NSLock()
+  private var bytes = Data()
+  private var requestID: PHAssetResourceDataRequestID?
+  private var failure: Error?
+
+  func setRequestID(_ id: PHAssetResourceDataRequestID) {
+    lock.lock()
+    requestID = id
+    let stopped = failure != nil
+    lock.unlock()
+    if stopped { PHAssetResourceManager.default().cancelDataRequest(id) }
+  }
+
+  func append(_ chunk: Data) {
+    lock.lock()
+    if failure == nil {
+      if bytes.count + chunk.count > 64 * 1024 * 1024 {
+        failure = PhotoPickerError.tooLarge
+        bytes.removeAll()
+      } else {
+        bytes.append(chunk)
+      }
+    }
+    let cancelID = failure != nil ? requestID : nil
+    lock.unlock()
+    if let id = cancelID { PHAssetResourceManager.default().cancelDataRequest(id) }
+  }
+
+  func cancel() {
+    lock.lock()
+    failure = PhotoPickerError.cancelled
+    bytes.removeAll()
+    let id = requestID
+    lock.unlock()
+    if let id = id { PHAssetResourceManager.default().cancelDataRequest(id) }
+  }
+
+  func finish(_ error: Error?) -> Result<Data, Error> {
+    lock.lock()
+    defer { lock.unlock() }
+    if let error = failure ?? error { return .failure(error) }
+    return .success(bytes)
+  }
+}
+
+extension ViewController: PHPickerViewControllerDelegate {
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+    guard let requestID = photoPickerRequestID else { return }
+    if results.isEmpty {
+      finishPhotoPicker([], error: nil, requestID: requestID)
+      return
+    }
+    let timeout = DispatchWorkItem { [weak self] in
+      self?.finishPhotoPicker(nil, error: "Photo import timed out", requestID: requestID)
+    }
+    photoPickerTimeout = timeout
+    DispatchQueue.main.asyncAfter(deadline: .now() + 120, execute: timeout)
+    photoPickerTask = Task { @MainActor [weak self] in
+      guard let self = self else { return }
+      do {
+        var files = [[String: String]]()
+        var totalBytes = 0
+        for result in results {
+          try Task.checkCancellation()
+          let provider = result.itemProvider
+          if provider.canLoadObject(ofClass: PHLivePhoto.self) {
+            let livePhoto = try await self.loadLivePhoto(provider)
+            let resources = PHAssetResource.assetResources(for: livePhoto)
+            guard let photo = resources.first(where: { $0.type == .photo }),
+              let video = resources.first(where: { $0.type == .pairedVideo })
+            else { throw PhotoPickerError.unavailable }
+            let pair = UUID().uuidString
+            for (resource, kind) in [(photo, "photo"), (video, "video")] {
+              let data = try await self.readPhotoResource(resource)
+              try Task.checkCancellation()
+              totalBytes += data.count
+              guard totalBytes <= 64 * 1024 * 1024 else { throw PhotoPickerError.tooLarge }
+              files.append([
+                "name": resource.originalFilename,
+                "mimeType": UTType(resource.uniformTypeIdentifier)?.preferredMIMEType ?? "application/octet-stream",
+                "data": data.base64EncodedString(), "pair": pair, "kind": kind,
+              ])
+            }
+          } else {
+            guard let identifier = provider.registeredTypeIdentifiers.first(where: {
+              UTType($0)?.conforms(to: .image) == true
+            }) else { throw PhotoPickerError.unavailable }
+            let data = try await self.loadPhotoData(provider, identifier: identifier)
+            try Task.checkCancellation()
+            totalBytes += data.count
+            guard totalBytes <= 64 * 1024 * 1024 else { throw PhotoPickerError.tooLarge }
+            let type = UTType(identifier)
+            var name = provider.suggestedName ?? UUID().uuidString
+            if URL(fileURLWithPath: name).pathExtension.isEmpty {
+              name += "." + (type?.preferredFilenameExtension ?? "jpg")
+            }
+            files.append([
+              "name": name, "mimeType": type?.preferredMIMEType ?? "application/octet-stream",
+              "data": data.base64EncodedString(), "pair": "", "kind": "photo",
+            ])
+          }
+        }
+        self.finishPhotoPicker(files, error: nil, requestID: requestID)
+      } catch {
+        self.finishPhotoPicker(nil, error: "Unable to import original photo resources", requestID: requestID)
+      }
+    }
+  }
+
+  private func loadLivePhoto(_ provider: NSItemProvider) async throws -> PHLivePhoto {
+    let state = PhotoProviderLoad<PHLivePhoto>()
+    return try await withTaskCancellationHandler(operation: {
+      try await withCheckedThrowingContinuation { continuation in
+        guard state.setContinuation(continuation) else { return }
+        let progress = provider.loadObject(ofClass: PHLivePhoto.self) { object, error in
+          if let photo = object as? PHLivePhoto {
+            state.finish(.success(photo))
+          } else {
+            state.finish(.failure(error ?? PhotoPickerError.unavailable))
+          }
+        }
+        state.setProgress(progress)
+      }
+    }, onCancel: { state.cancel() })
+  }
+
+  private func loadPhotoData(_ provider: NSItemProvider, identifier: String) async throws -> Data {
+    let state = PhotoProviderLoad<Data>()
+    return try await withTaskCancellationHandler(operation: {
+      try await withCheckedThrowingContinuation { continuation in
+        guard state.setContinuation(continuation) else { return }
+        let progress = provider.loadDataRepresentation(forTypeIdentifier: identifier) { data, error in
+          if let data = data, data.count <= 64 * 1024 * 1024 {
+            state.finish(.success(data))
+          } else {
+            state.finish(.failure(error ?? PhotoPickerError.tooLarge))
+          }
+        }
+        state.setProgress(progress)
+      }
+    }, onCancel: { state.cancel() })
+  }
+
+  private func readPhotoResource(_ resource: PHAssetResource) async throws -> Data {
+    let state = PhotoResourceRead()
+    return try await withTaskCancellationHandler(operation: {
+      try await withCheckedThrowingContinuation { continuation in
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        let id = PHAssetResourceManager.default().requestData(for: resource, options: options,
+          dataReceivedHandler: { state.append($0) }, completionHandler: { error in
+            continuation.resume(with: state.finish(error))
+          })
+        state.setRequestID(id)
+      }
+    }, onCancel: { state.cancel() })
+  }
+}
+
 extension UIColor {
   convenience init?(hexString: String?, isDarkMode: Bool) {
     let input = (hexString ?? "")
@@ -1321,6 +2026,29 @@ extension UIColor {
     Scanner(string: fullHex)
       .scanHexInt64(&hexComponent)
     return CGFloat(Double(hexComponent) / 255.0)
+  }
+}
+
+@available(iOS 16.0, *)
+extension ViewController: UIEditMenuInteractionDelegate {
+  func editMenuInteraction(
+    _ interaction: UIEditMenuInteraction, targetRectFor configuration: UIEditMenuConfiguration
+  ) -> CGRect {
+    return textMenuRect
+  }
+
+  func editMenuInteraction(
+    _ interaction: UIEditMenuInteraction, willPresentMenuFor configuration: UIEditMenuConfiguration,
+    animator: UIEditMenuInteractionAnimating
+  ) {
+    textMenuVisible = true
+  }
+
+  func editMenuInteraction(
+    _ interaction: UIEditMenuInteraction, willDismissMenuFor configuration: UIEditMenuConfiguration,
+    animator: UIEditMenuInteractionAnimating
+  ) {
+    textMenuVisible = false
   }
 }
 
