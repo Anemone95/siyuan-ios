@@ -64,8 +64,17 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   private var textMenuVisible = false
   private var textMenuRequestGeneration: UInt = 0
   private var textMenuRect = CGRect.zero
+  // 部署目标低于 iOS 16，存储属性不能按系统版本标注，交互对象在首次访问时创建。
+  private var textMenuInteractionStorage: AnyObject?
   @available(iOS 16.0, *)
-  private lazy var textMenuInteraction = UIEditMenuInteraction(delegate: self)
+  private var textMenuInteraction: UIEditMenuInteraction {
+    if let interaction = textMenuInteractionStorage as? UIEditMenuInteraction {
+      return interaction
+    }
+    let interaction = UIEditMenuInteraction(delegate: self)
+    textMenuInteractionStorage = interaction
+    return interaction
+  }
   private var photoPickerReply: ((Any?, String?) -> Void)?
   private var photoPickerRequestID: UUID?
   private var photoPickerTask: Task<Void, Never>?
@@ -127,6 +136,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
 
   deinit {
     // make sure to remove the observer when this view controller is dismissed/deallocated
+    KernelRecoveryCoordinator.shared.detach(ViewController.syWebView, owner: self)
     NotificationCenter.default.removeObserver(self)
     bootProgressMonitorActive = false
     bootProgressTask?.cancel()
@@ -156,6 +166,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
       red: 0x1e / 255.0, green: 0x1e / 255.0, blue: 0x1e / 255.0, alpha: 1)
     applyStatusBarAppearance(color: startupColor, isDark: true)
 
+    KernelRecoveryCoordinator.shared.install(ViewController.syWebView, owner: self)
     initKernel()
 
     ViewController.syWebView.customUserAgent =
@@ -227,22 +238,21 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
 
     // 息屏/应用切换
     NotificationCenter.default.addObserver(
-      self, selector: #selector(willEnterForeground),
-      name: UIApplication.willEnterForegroundNotification, object: nil)
-    NotificationCenter.default.addObserver(
-      self, selector: #selector(willEnterForeground),
-      name: UIApplication.didBecomeActiveNotification, object: nil)
-    NotificationCenter.default.addObserver(
       self, selector: #selector(suspendStartupMonitoring),
       name: UIApplication.didEnterBackgroundNotification, object: nil)
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(resumeStartupMonitoring),
+      name: UIApplication.willEnterForegroundNotification, object: nil)
     NotificationCenter.default.addObserver(
       self, selector: #selector(protectedDataDidBecomeUnavailable),
       name: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil)
     ViewController.syWebView.isHidden = true
     // 网页置于容器底层，保留系统窗口控件的显示层级。
     view.insertSubview(ViewController.syWebView, at: 0)
-    loadBootPage(url)
-    startBootProgressMonitor()
+    KernelRecoveryCoordinator.shared.whenAccepting { [weak self] in
+      self?.loadBootPage(url)
+      self?.startBootProgressMonitor()
+    }
     #if DEBUG
       if #available(iOS 16.4, *) {
         ViewController.syWebView.isInspectable = true
@@ -536,8 +546,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   ) {
     switch ScriptMessageName(rawValue: message.name) {
     case .startKernelFast:
-      let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-      Iosk.MobileStartKernelFast("ios", Bundle.main.resourcePath, urls[0].path, "")
+      KernelRecoveryCoordinator.shared.retry(message)
     case .changeStatusBar:
       guard let value = message.body as? String else { return }
       let argument = value.split(separator: " ")
@@ -579,8 +588,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     case .print:
       printDynamicHTML(message.body as! String)
     case .exit:
-      UIApplication.shared.perform(#selector(NSXPCConnection.suspend))
-      exit(0)
+      KernelRecoveryCoordinator.shared.exitKernel()
     case .sendNotification:
       let dict = message.body as? [String: Any]
       let channel = dict!["channel"] as? String ?? "default"
@@ -752,7 +760,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
 
   func initKernel() {
     let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-    Iosk.MobileStartKernel(
+    Iosk.MobileStartKernelWithRecovery(
       "ios", Bundle.main.resourcePath, urls[0].path, TimeZone.current.identifier, getIP(),
       Locale.preferredLanguages[0].prefix(2) == "zh" ? "zh-CN" : "en",
       UIDevice.current.systemVersion)
@@ -1124,6 +1132,13 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
     cancelMainPageWatchdog()
   }
 
+  // 内核恢复由恢复协调器处理，回到前台只重新计时主界面启动监测。
+  @objc private func resumeStartupMonitoring() {
+    if kernelBootCompleted && !mainPageReady && startupFailureView == nil {
+      scheduleMainPageWatchdog()
+    }
+  }
+
   private func scheduleWebViewRecovery(error: Error? = nil, recoverLoadedPage: Bool = false) {
     if let error = error {
       let nsError = error as NSError
@@ -1384,6 +1399,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+    KernelRecoveryCoordinator.shared.invalidatePage(webView)
     guard let url = webView.url,
       isLocalKernelURL(url), !isBootDocument(url)
     else {
@@ -1406,6 +1422,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    KernelRecoveryCoordinator.shared.navigationFinished(webView)
     if webView == bootWebView {
       cancelWebViewRecovery()
       if let url = webView.url, isLocalKernelURL(url),
@@ -1455,6 +1472,7 @@ class ViewController: UIViewController, WKNavigationDelegate, UIScrollViewDelega
   }
 
   func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    KernelRecoveryCoordinator.shared.invalidatePage(webView)
     guard webView == ViewController.syWebView || webView == bootWebView else {
       return
     }

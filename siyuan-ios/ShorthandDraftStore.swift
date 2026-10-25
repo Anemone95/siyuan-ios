@@ -20,7 +20,7 @@ import Foundation
 
 final class ShorthandDraftStore {
 
-  private static let appGroupIdentifier = "group.com.ld246.siyuan"
+  static let appGroupIdentifier = Bundle.main.object(forInfoDictionaryKey: "SiYuanAppGroupIdentifier") as? String ?? "group.com.ld246.siyuan"
   private static let saveDelay = DispatchTimeInterval.milliseconds(250)
 
   private let fileName: String

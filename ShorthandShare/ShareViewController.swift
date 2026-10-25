@@ -405,7 +405,7 @@ class ShareViewController: UIViewController, UITextViewDelegate {
     private func shorthandsDirectory() throws -> URL {
         guard
             let containerURL = FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: "group.com.ld246.siyuan")
+                forSecurityApplicationGroupIdentifier: ShorthandDraftStore.appGroupIdentifier)
         else {
             throw ShorthandShareError.appGroupUnavailable
         }
@@ -416,7 +416,7 @@ class ShareViewController: UIViewController, UITextViewDelegate {
     private func stagedAssetsDirectory(createDirectory: Bool = true) throws -> URL {
         guard
             let containerURL = FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: "group.com.ld246.siyuan")
+                forSecurityApplicationGroupIdentifier: ShorthandDraftStore.appGroupIdentifier)
         else {
             throw ShorthandShareError.appGroupUnavailable
         }
